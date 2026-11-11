@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>發票轉報稅 Excel</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+<script src="lib/zxing-reader.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
 :root{--bg:#fff;--fg:#1c1c1e;--mut:#6b6b70;--line:#ddd;--card:#f6f7f9;--pri:#1f5fa6;--ok:#2e7d32;--warn:#c62828;--m1:#ebf3fb;--m2:#ebf7ee}
@@ -93,20 +93,41 @@ $('#clr').onclick=()=>{files=[];rows=[];$('#go').disabled=true;$('#msg').textCon
 /* ---------- 讀取圖片 ---------- */
 const loadImg=f=>new Promise((ok,no)=>{const i=new Image();i.onload=()=>ok(i);i.onerror=no;i.src=URL.createObjectURL(f)});
 
-/* ---------- QR 辨識（電子發票左側 QR） ---------- */
+/* ---------- QR 辨識（電子發票左側 QR；ZXing + 多種前處理） ---------- */
 const isInv=s=>/^[A-Z]{2}\d{15}.{4}[0-9a-fA-F]{16}\d{16}/.test(s);
-function scanQR(img){
-  for(const maxW of [1600,2400,900]){
-    const sc=Math.min(1,maxW/Math.max(img.width,img.height));
-    const c=document.createElement('canvas');c.width=Math.round(img.width*sc);c.height=Math.round(img.height*sc);
-    const x=c.getContext('2d',{willReadFrequently:true});x.drawImage(img,0,0,c.width,c.height);
-    for(let i=0;i<3;i++){
-      const d=x.getImageData(0,0,c.width,c.height);
-      const r=jsQR(d.data,c.width,c.height,{inversionAttempts:'attemptBoth'});
-      if(!r)break;
-      if(isInv(r.data))return r.data;
-      const L=r.location,xs=[L.topLeftCorner,L.topRightCorner,L.bottomLeftCorner,L.bottomRightCorner].map(p=>p.x),ys=[L.topLeftCorner,L.topRightCorner,L.bottomLeftCorner,L.bottomRightCorner].map(p=>p.y);
-      x.fillStyle='#fff';x.fillRect(Math.min(...xs)-6,Math.min(...ys)-6,Math.max(...xs)-Math.min(...xs)+12,Math.max(...ys)-Math.min(...ys)+12);
+let zx;
+const initZX=()=>zx||(zx=ZXingWASM.prepareZXingModule({overrides:{locateFile:(p,pre)=>p.endsWith('.wasm')?'lib/zxing_reader.wasm':pre+p},fireImmediately:true}));
+// 區域自適應二值化（解決反光、陰影、熱感紙對比不均）
+function adaptive(g,w,h,win,off){
+  const W1=w+1,I=new Uint32Array(W1*(h+1));
+  for(let y=1;y<=h;y++){let r=0;for(let x=1;x<=w;x++){r+=g[(y-1)*w+x-1];I[y*W1+x]=I[(y-1)*W1+x]+r}}
+  const o=new Uint8ClampedArray(w*h),k=win>>1;
+  for(let y=0;y<h;y++){const y0=Math.max(0,y-k),y1=Math.min(h,y+k+1);
+    for(let x=0;x<w;x++){const x0=Math.max(0,x-k),x1=Math.min(w,x+k+1),n=(x1-x0)*(y1-y0);
+      const s=I[y1*W1+x1]-I[y0*W1+x1]-I[y1*W1+x0]+I[y0*W1+x0];
+      o[y*w+x]=g[y*w+x]*n<s-off*n?0:255}}
+  return o;
+}
+async function decodeGray(g,w,h){
+  const px=new Uint8ClampedArray(w*h*4);
+  for(let p=0;p<w*h;p++){const v=g[p],q=p*4;px[q]=px[q+1]=px[q+2]=v;px[q+3]=255}
+  const rs=await ZXingWASM.readBarcodes(new ImageData(px,w,h),{formats:['QRCode'],tryHarder:true,tryRotate:true,tryInvert:true,tryDownscale:true,maxNumberOfSymbols:4});
+  return rs.map(r=>r.text).find(isInv)||null;
+}
+async function scanQR(img){
+  await initZX();
+  const base=Math.min(img.width,1920);
+  for(const sc of [1,1.5,0.6]){
+    const w=Math.round(base*sc),h=Math.round(img.height*w/img.width);
+    const c=document.createElement('canvas');c.width=w;c.height=h;
+    const x=c.getContext('2d',{willReadFrequently:true});x.drawImage(img,0,0,w,h);
+    const d=x.getImageData(0,0,w,h).data,g=new Uint8ClampedArray(w*h);
+    for(let p=0;p<w*h;p++)g[p]=(d[p*4]*77+d[p*4+1]*151+d[p*4+2]*28)>>8;
+    const tries=[()=>g];
+    if(w*h<16e6){tries.push(()=>adaptive(g,w,h,Math.round(w/12),6));if(sc===1.5)tries.push(()=>adaptive(g,w,h,Math.round(w/20),10))}
+    for(const t of tries){
+      await new Promise(r=>setTimeout(r));
+      const hit=await decodeGray(t(),w,h);if(hit)return hit;
     }
   }
   return null;
@@ -139,7 +160,7 @@ $('#go').onclick=async()=>{
   for(const f of files){
     $('#msg').textContent=`辨識中 ${++n}/${files.length}…`;
     try{
-      const img=await loadImg(f),q=scanQR(img);
+      const img=await loadImg(f),q=await scanQR(img);
       rows.push({...(q?parseQR(q):await aiRead(f)),file:f.name});
     }catch(e){fail.push(f.name+'（'+e.message+'）')}
   }
